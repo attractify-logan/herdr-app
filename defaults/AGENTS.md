@@ -817,6 +817,14 @@ has 120 programs (agents, editors, runtimes, tools, databases, infra);
   `spaces` sidebar nests worktree spaces under their repo's and shows each
   space's repo, branch, ahead/behind and uncommitted changes). Shipped mods
   are Herdr's; duplicate with `mod.clone` before editing.
+- Automatic Git reads in Spaces, Files, Changes and Worktree don't fetch missing
+  objects or run repository-defined filter, external diff or textconv commands
+  (standard git-lfs filters are allowed). With older Git that lacks
+  `--no-lazy-fetch`, these reads refuse partial/promisor repositories. Explicit
+  commits and worktree add/remove still use the person's normal Git commands.
+  Repos with local filter commands still show their branch and ahead/behind in
+  Spaces and allow Worktree New/Open. Remove needs a dirty check, so remove those
+  worktrees from a terminal instead.
 
 ### Check before you finish
 

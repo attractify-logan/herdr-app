@@ -7,6 +7,46 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
 
+// Older Git cannot disable lazy fetches; checkGit refuses promisor repos there.
+const gitReadPrefixes = new Map();
+async function safePrefix(on) {
+  const machine = on ?? null;
+  if (!gitReadPrefixes.has(machine)) {
+    gitReadPrefixes.set(machine, exec("git", ["--no-lazy-fetch", "version"], { on }).then((r) =>
+      [...(r.code === 0 ? ["--no-lazy-fetch"] : []), "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "status.submoduleSummary=false", "-c", "diff.autoRefreshIndex=false"]
+    ).catch((error) => { gitReadPrefixes.delete(machine); throw error; }));
+  }
+  return gitReadPrefixes.get(machine);
+}
+
+// A copied .git/config is not consent to run its filter drivers.
+// Keep ordinary LFS filters, but not repository-defined LFS extensions/transfers.
+async function checkGit(cwd, on, allowFilters = false) {
+  const prefix = await safePrefix(on);
+  const r = await exec("git", ["config", "--includes", "--show-scope", "--null", "--get-regexp", "^(filter\\..+\\.(clean|smudge|process)|lfs\\.(extension|customtransfer)\\..+|extensions\\.partialclone|remote\\..+\\.(promisor|partialclonefilter))$"], { cwd, on });
+  if (r.code === 1) return prefix;
+  const denied = () => { throw new Error("Git changes unavailable: repository config defines commands"); };
+  if (r.code !== 0) denied();
+  const records = r.stdout.split("\0");
+  if (records.pop() !== "" || !records.length || records.length % 2) denied();
+  const lfs = { "filter.lfs.clean": ["git-lfs clean -- %f"], "filter.lfs.smudge": ["git-lfs smudge -- %f", "git-lfs smudge --skip -- %f"], "filter.lfs.process": ["git-lfs filter-process", "git-lfs filter-process --skip"] };
+  for (let i = 0; i < records.length; i += 2) {
+    const at = records[i + 1].indexOf("\n");
+    if (/^(extensions\.partialclone|remote\..+\.(promisor|partialclonefilter))$/.test(records[i + 1].slice(0, at))) {
+      if (!prefix.includes("--no-lazy-fetch")) throw new Error("Git changes unavailable: partial clones need Git with --no-lazy-fetch");
+      continue;
+    }
+    if (records[i] !== "local" && records[i] !== "worktree") continue;
+    if (at < 0) denied();
+    if (!allowFilters && !lfs[records[i + 1].slice(0, at)]?.includes(records[i + 1].slice(at + 1))) {
+      const error = new Error("Git changes unavailable: repository config defines commands");
+      error.code = "GIT_FILTER";
+      throw error;
+    }
+  }
+  return prefix;
+}
+
 function find(node, id) {
   if (node?.id === id) return node;
   for (const child of node?.children ?? []) {
@@ -201,7 +241,21 @@ export default class Spaces extends View {
     try {
       // No optional locks: a status that touched the index would wake the watch again.
       // Writes nothing under .git (index lock, fsmonitor cookie): watch() would wake on it.
-      const r = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v2", "--branch"], { cwd, on });
+      let READ, filtered = false;
+      try { READ = await checkGit(cwd, on); }
+      catch (error) {
+        if (error.code !== "GIT_FILTER") throw error;
+        READ = await checkGit(cwd, on, true);
+        filtered = true;
+      }
+      const r = filtered
+        // Not --short: it says heads/main when a tag is also called main.
+        ? await exec("git", [...READ, "symbolic-ref", "--quiet", "HEAD"], { cwd, on })
+        : await exec("git", [...READ, "status", "--ignore-submodules=all", "--porcelain=v2", "--branch"], { cwd, on });
+      if (filtered && r.code === 1) {
+        const head = await exec("git", [...READ, "rev-parse", "--verify", "HEAD"], { cwd, on });
+        if (head.code === 0) { r.code = 0; r.stdout = "(detached)"; }
+      }
       if (r.code !== 0) {
         // Only git's own "no" is remembered as no repo; anything else is asked again.
         if (!/not a git repository/i.test(r.stderr)) this.unsure.add(key);
@@ -209,12 +263,19 @@ export default class Spaces extends View {
         return;
       }
       // The repo's own .git folder names it; a worktree's top differs from it.
-      const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
-      const common = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, on });
+      const top = await exec("git", [...READ, "rev-parse", "--show-toplevel"], { cwd, on });
+      // Status already refuses a folder inside .git; the filter-free path must too.
+      if (filtered && top.code !== 0) { this.git[key] = null; return; }
+      const common = await exec("git", [...READ, "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, on });
       const repo = common.stdout.trim();
       const name = repo.endsWith("/.git") ? base(repo.slice(0, -5)) : base(repo).replace(/\.git$/, "");
       const info = { name, branch: null, ahead: 0, behind: 0, repo: JSON.stringify([on, repo]), linked: repo !== `${top.stdout.trim()}/.git` };
-      for (const line of r.stdout.split("\n")) {
+      if (filtered) {
+        info.branch = r.stdout.trim().replace(/^refs\/heads\//, "");
+        const counts = await exec("git", [...READ, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"], { cwd, on });
+        if (counts.code === 0) [info.ahead, info.behind] = counts.stdout.trim().split(/\s+/).map(Number);
+      }
+      for (const line of filtered ? [] : r.stdout.split("\n")) {
         if (line.startsWith("# branch.head ")) info.branch = line.slice(14);
         else if (line.startsWith("# branch.ab ")) {
           const [a, b] = line.slice(12).split(" ");

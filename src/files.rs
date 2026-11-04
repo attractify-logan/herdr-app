@@ -114,7 +114,7 @@ mod linux {
 
     /// Git supplies its own ignore semantics, including global and nested rules.
     fn ignored_directories(root: &Path) -> HashSet<PathBuf> {
-        let Ok(output) = std::process::Command::new("git").arg("-C").arg(root).args(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]).output() else {
+        let Ok(output) = std::process::Command::new("git").arg("-C").arg(root).env("GIT_NO_LAZY_FETCH", "1").env("GIT_ALLOW_PROTOCOL", "").args(["-c", "core.fsmonitor=false", "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]).output() else {
             return HashSet::new();
         };
         if !output.status.success() {
@@ -132,7 +132,7 @@ mod linux {
         let ignored = ignored_directories(root);
         let mut paths = HashSet::from([root.to_path_buf()]);
         let mut git_roots = HashSet::new();
-        if let Ok(output) = std::process::Command::new("git").arg("-C").arg(root).args(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"]).output()
+        if let Ok(output) = std::process::Command::new("git").arg("-C").arg(root).env("GIT_NO_LAZY_FETCH", "1").env("GIT_ALLOW_PROTOCOL", "").args(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"]).output()
             && output.status.success()
         {
             for line in output.stdout.split(|b| *b == b'\n').filter(|p| !p.is_empty()) {
@@ -383,6 +383,20 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         assert!(std::process::Command::new("git").arg("init").arg("-q").arg(&root).status().unwrap().success());
         root.canonicalize().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watching_a_copied_repo_does_not_run_its_fsmonitor_command() {
+        let root = test_repo("fsmonitor");
+        let marker = root.join("fsmonitor-ran");
+        std::fs::write(root.join("tracked"), "tracked").unwrap();
+        assert!(std::process::Command::new("git").arg("-C").arg(&root).args(["add", "tracked"]).status().unwrap().success());
+        let hook = format!("echo invoked > '{}'; printf '\\0'", marker.display());
+        assert!(std::process::Command::new("git").arg("-C").arg(&root).args(["config", "core.fsmonitor", &hook]).status().unwrap().success());
+        assert!(watch_directories(&root).unwrap().contains(&root));
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // Backends may invalidate a parent rather than name every changed child.

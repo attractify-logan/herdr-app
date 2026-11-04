@@ -2,6 +2,41 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings } from "herdr";
 
+// Older Git cannot disable lazy fetches; checkGit refuses promisor repos there.
+const gitReadPrefixes = new Map();
+async function safePrefix(on) {
+  const machine = on ?? null;
+  if (!gitReadPrefixes.has(machine)) {
+    gitReadPrefixes.set(machine, exec("git", ["--no-lazy-fetch", "version"], { on }).then((r) =>
+      [...(r.code === 0 ? ["--no-lazy-fetch"] : []), "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "status.submoduleSummary=false", "-c", "diff.autoRefreshIndex=false"]
+    ).catch((error) => { gitReadPrefixes.delete(machine); throw error; }));
+  }
+  return gitReadPrefixes.get(machine);
+}
+
+// A copied .git/config is not consent to run its filter drivers.
+// Keep ordinary LFS filters, but not repository-defined LFS extensions/transfers.
+async function checkGit(cwd, on) {
+  const prefix = await safePrefix(on);
+  const r = await exec("git", ["config", "--includes", "--show-scope", "--null", "--get-regexp", "^(filter\\..+\\.(clean|smudge|process)|lfs\\.(extension|customtransfer)\\..+|extensions\\.partialclone|remote\\..+\\.(promisor|partialclonefilter))$"], { cwd, on });
+  if (r.code === 1) return prefix;
+  const denied = () => { throw new Error("Git changes unavailable: repository config defines commands"); };
+  if (r.code !== 0) denied();
+  const records = r.stdout.split("\0");
+  if (records.pop() !== "" || !records.length || records.length % 2) denied();
+  const lfs = { "filter.lfs.clean": ["git-lfs clean -- %f"], "filter.lfs.smudge": ["git-lfs smudge -- %f", "git-lfs smudge --skip -- %f"], "filter.lfs.process": ["git-lfs filter-process", "git-lfs filter-process --skip"] };
+  for (let i = 0; i < records.length; i += 2) {
+    const at = records[i + 1].indexOf("\n");
+    if (/^(extensions\.partialclone|remote\..+\.(promisor|partialclonefilter))$/.test(records[i + 1].slice(0, at))) {
+      if (!prefix.includes("--no-lazy-fetch")) throw new Error("Git changes unavailable: partial clones need Git with --no-lazy-fetch");
+      continue;
+    }
+    if (records[i] !== "local" && records[i] !== "worktree") continue;
+    if (at < 0 || !lfs[records[i + 1].slice(0, at)]?.includes(records[i + 1].slice(at + 1))) denied();
+  }
+  return prefix;
+}
+
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
   const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
@@ -9,9 +44,6 @@ function location() {
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on };
 }
 const key = () => JSON.stringify(location());
-// Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie):
-// the folder watch would see it, and every refresh would start the next one.
-const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
 const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
 
 // Numbers each diff line once, so a frame only draws the rows on screen.
@@ -68,15 +100,16 @@ export default class Changes extends View {
     this.loading = true;
     cx.spawn(async (cx) => {
       try {
-        const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
+        const top = await exec("git", [...await safePrefix(on), "rev-parse", "--show-toplevel"], { cwd, on });
         if (key() !== context) return;
         if (top.code !== 0) { this.root = null; this.files = []; this.setLines([]); this.open = null; this.error = "Not a git repository"; return; }
-        const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
-        const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
+        const root = top.stdout.trim(), READ = await checkGit(root, on);
+        const git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
+        const status = await git(["status", "--ignore-submodules=dirty", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
         if (status.code !== 0) throw new Error(status.stderr);
         const head = await git(["rev-parse", "--verify", "HEAD"]);
         const stats = {};
-        const results = head.code === 0 ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])] : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
+        const results = head.code === 0 ? [await git(["diff", "--submodule=short", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "HEAD", "--numstat", "-z", "--no-renames"])] : [await git(["diff", "--submodule=short", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--submodule=short", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--numstat", "-z", "--no-renames"])];
         for (const result of results) {
           if (result.code !== 0) throw new Error(result.stderr);
           for (const entry of result.stdout.split("\0")) {
@@ -123,7 +156,8 @@ export default class Changes extends View {
         lines = [`@@ -0,0 +1,${file.add} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map(l => `+${l}`)];
       }
     } else {
-      const r = await exec("git", [...READ, "diff", ...(this.hasHead ? ["HEAD"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", path], { cwd: root, on });
+      const READ = await checkGit(root, on);
+      const r = await exec("git", [...READ, "diff", ...(this.hasHead ? ["HEAD"] : []), "--ignore-submodules=dirty", "--submodule=short", "--no-ext-diff", "--no-textconv", "--no-color", "--", path], { cwd: root, on });
       if (r.code !== 0) throw new Error(r.stderr);
       const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
       lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);

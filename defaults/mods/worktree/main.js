@@ -5,6 +5,54 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar } from "gpui-base";
 import { run, props, closeOverlay, theme, spaces, panes, exec, home } from "herdr";
 
+// Older Git cannot disable lazy fetches; checkGit refuses promisor repos there.
+const gitReadPrefixes = new Map();
+async function safePrefix(on) {
+  const machine = on ?? null;
+  if (!gitReadPrefixes.has(machine)) {
+    gitReadPrefixes.set(machine, exec("git", ["--no-lazy-fetch", "version"], { on }).then((r) =>
+      [...(r.code === 0 ? ["--no-lazy-fetch"] : []), "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "status.submoduleSummary=false", "-c", "diff.autoRefreshIndex=false"]
+    ).catch((error) => { gitReadPrefixes.delete(machine); throw error; }));
+  }
+  return gitReadPrefixes.get(machine);
+}
+
+// A copied .git/config is not consent to run its filter drivers.
+// Keep ordinary LFS filters, but not repository-defined LFS extensions/transfers.
+async function checkGit(cwd, on, recursive = false, repoArgs = [], allowFilters = false) {
+  const prefix = await safePrefix(on);
+  const pattern = "^(filter\\..+\\.(clean|smudge|process)|lfs\\.(extension|customtransfer)\\..+|extensions\\.partialclone|remote\\..+\\.(promisor|partialclonefilter))$";
+  validateGitConfig(await exec("git", [...repoArgs, "config", "--includes", "--show-scope", "--null", "--get-regexp", pattern], { cwd, on }), prefix, allowFilters);
+  if (recursive) {
+    // Unlike sidebar reads, removal must still warn about dirty submodules.
+    const r = await exec("git", [...prefix, "submodule", "--quiet", "foreach", "--recursive", "git config --includes --show-scope --null --get-regexp '" + pattern + "' || test \"$?\" = 1"], { cwd, on });
+    if (r.code !== 0) throw new Error("Cannot check submodule config");
+    if (r.stdout) validateGitConfig(r, prefix);
+  }
+  return prefix;
+}
+
+function validateGitConfig(r, prefix, allowFilters = false) {
+  if (r.code === 1) return;
+  const denied = () => { throw new Error("Git changes unavailable: repository config defines commands"); };
+  if (r.code !== 0) denied();
+  const records = r.stdout.split("\0");
+  if (records.pop() !== "" || !records.length || records.length % 2) denied();
+  const lfs = { "filter.lfs.clean": ["git-lfs clean -- %f"], "filter.lfs.smudge": ["git-lfs smudge -- %f", "git-lfs smudge --skip -- %f"], "filter.lfs.process": ["git-lfs filter-process", "git-lfs filter-process --skip"] };
+  for (let i = 0; i < records.length; i += 2) {
+    const at = records[i + 1].indexOf("\n");
+    if (/^(extensions\.partialclone|remote\..+\.(promisor|partialclonefilter))$/.test(records[i + 1].slice(0, at))) {
+      if (!prefix.includes("--no-lazy-fetch")) throw new Error("Git changes unavailable: partial clones need Git with --no-lazy-fetch");
+      continue;
+    }
+    if (records[i] !== "local" && records[i] !== "worktree") continue;
+    if (at < 0) denied();
+    if (!allowFilters && !lfs[records[i + 1].slice(0, at)]?.includes(records[i + 1].slice(at + 1))) {
+      throw new Error("Remove this worktree from a terminal: repository config defines filter commands.");
+    }
+  }
+}
+
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s, all = panes()) {
   if (!s) return null;
@@ -53,8 +101,10 @@ function spaceOf(path, all, on, spaceList, paneList) {
   })());
 }
 
-async function git(cwd, args, on) {
-  const r = await exec("git", args, { cwd, on });
+async function git(cwd, args, on, write = false) {
+  const repoArgs = args[0] === "--git-dir" ? args.slice(0, 2) : [];
+  const prefix = write ? [] : await checkGit(cwd, on, false, repoArgs, !args.includes("status"));
+  const r = await exec("git", [...prefix, ...args], { cwd, on });
   return { ok: r.code === 0, out: (r.stdout ?? "").trim(), err: (r.stderr ?? r.stdout ?? "").trim() };
 }
 
@@ -142,7 +192,8 @@ export default class Worktree extends View {
         // The repo is set last: Enter does nothing until the warnings it consents to are known.
         const repo = await repoOf(this.folder, this.on);
         if (repo && props().action === "remove") {
-          this.dirty = (await git(repo.top, ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"], this.on)).out !== "";
+          await checkGit(repo.top, this.on, true);
+          this.dirty = (await git(repo.top, ["status", "--porcelain"], this.on)).out !== "";
           this.unpushed = (await submodules(repo.top, this.on)).unpushed;
         }
         if (repo && this.opening) this.list = await checkouts(repo, this.on);
@@ -185,7 +236,7 @@ export default class Worktree extends View {
     const path = `${ROOT(this.userHome)}/${this.repo.name}/${slug(branch)}`;
     const exists = (await git(this.repo.main, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], this.on)).ok;
     const add = exists ? ["worktree", "add", path, branch] : ["worktree", "add", "-b", branch, path, "HEAD"];
-    const r = await git(this.repo.top, add, this.on);
+    const r = await git(this.repo.top, add, this.on, true);
     if (!r.ok) return r.err || "git worktree add failed.";
     const p = props();
     // Leave spaces unnamed so they follow the checkout folder and nest under the repo.
@@ -208,7 +259,9 @@ export default class Worktree extends View {
 
   async remove() {
     const s = this.space();
-    const status = await git(this.repo.top, ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"], this.on);
+    try { await checkGit(this.repo.top, this.on, true); }
+    catch (error) { return String(error); }
+    const status = await git(this.repo.top, ["status", "--porcelain"], this.on);
     if (!status.ok) return status.err || "git status failed.";
     // git refuses a worktree with submodules unless forced, because their
     // history goes with it. The popup already showed what's at risk; only
@@ -221,7 +274,7 @@ export default class Worktree extends View {
     // Terminals first: a shell sitting in the folder keeps it busy on Windows.
     run("space.close", { id: s.id, confirmed: true });
     const force = this.dirty || mods.length > 0;
-    const r = await git(this.repo.main, ["worktree", "remove", ...(force ? ["--force"] : []), this.repo.top], this.on);
+    const r = await git(this.repo.main, ["worktree", "remove", ...(force ? ["--force"] : []), this.repo.top], this.on, true);
     return r.ok ? "" : r.err || "git worktree remove failed.";
   }
 
