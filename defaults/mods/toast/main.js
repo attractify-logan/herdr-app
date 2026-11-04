@@ -18,6 +18,8 @@ export default class Toast extends View {
       .px(18)
       .gap(12)
       .items_center()
+      // Rounded as the frame is: children aren't clipped to its corners.
+      .rounded(8)
       .bg(t.popover)
       .cursor_pointer()
       .hover((s) => s.bg(t.hover))
