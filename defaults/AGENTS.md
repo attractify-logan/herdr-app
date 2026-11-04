@@ -263,6 +263,12 @@ Properties any node can have:
   right-clicks (including Shift+right-click). Omit it for the shipped `menu`;
   an unknown mod logs a warning and falls back to `menu`. Clone a shipped
   layout before changing this field. Other menus are unchanged.
+- Root only: `"toast": "my-toast"` chooses the mod that draws notifications
+  (Herdr's own and `notify()`'s), bottom right as usual. Omit it for the
+  shipped `toast`; an unknown mod warns and falls back. Its `mod.json`
+  overlay sets `width`/`height` (default 340×72), `frame: "none"` (it draws
+  its own edge, corners and shadow) and `props` (given under the
+  notification's `title`, `body`, `level`, `icon`, `action`).
 - Colors are theme names (`border`, `accent`, `surface`, ...) or `#rrggbb[aa]`.
 
 A personal terminal menu replaces the whole menu; it doesn't merge items.

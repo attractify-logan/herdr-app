@@ -3476,6 +3476,19 @@ impl AppWindow {
         self.open_overlay(mods::new_overlay_id(), spec, window, cx);
     }
 
+    /// A notification's spec for the layout's toast mod (root `toast`; default: `toast`).
+    fn layout_toast(&self, spec: Value) -> Value {
+        let requested = self.chrome.toast.as_deref().unwrap_or("toast");
+        let name = if self.folders.contains_key(requested) {
+            requested
+        } else {
+            tracing::warn!(mod_name = requested, "toast mod not found; using toast");
+            "toast"
+        };
+        let defaults = self.folders.get(name).filter(|_| name != "toast").map(|f| mod_overlay(&f.dir)).unwrap_or_else(|| json!({}));
+        toast_spec(name, &defaults, spec)
+    }
+
     fn open_overlay(&mut self, id: String, spec: Value, window: &mut Window, cx: &mut Context<Self>) {
         let kind = match spec.get("kind").and_then(Value::as_str) {
             Some("popup") => OverlayKind::Popup,
@@ -3483,6 +3496,7 @@ impl AppWindow {
             Some("window") => OverlayKind::Window,
             _ => OverlayKind::Dialog,
         };
+        let spec = if kind == OverlayKind::Toast { self.layout_toast(spec) } else { spec };
         let key = spec.get("key").and_then(Value::as_str).filter(|k| !k.is_empty() && kind == OverlayKind::Window).map(str::to_owned);
         // One window per name: opening it again replaces it, in its place.
         let mut place = key.as_deref().and_then(movable::place_of);
@@ -3500,7 +3514,7 @@ impl AppWindow {
             }
         });
         let (name, mut props) = if kind == OverlayKind::Toast {
-            ("toast".to_owned(), spec.get("notification").cloned().unwrap_or(Value::Null))
+            (spec.get("mod").and_then(Value::as_str).unwrap_or("toast").to_owned(), spec.get("notification").cloned().unwrap_or(Value::Null))
         } else {
             (spec.get("mod").and_then(Value::as_str).unwrap_or_default().to_owned(), spec.get("props").cloned().unwrap_or(json!({})))
         };
@@ -3510,7 +3524,7 @@ impl AppWindow {
         props["overlay"] = json!(id);
         let num = |k: &str, d: f32| spec.get(k).and_then(Value::as_f64).map_or(d, |v| v as f32);
         let size = match kind {
-            OverlayKind::Toast => size(340.0, num("height", 72.0)),
+            OverlayKind::Toast => size(num("width", 340.0), num("height", 72.0)),
             // No size: as big as its content (0 = unset).
             OverlayKind::Window => size(num("width", 0.0), num("height", 0.0)),
             // No height: as tall as the content, up to most of the window.
@@ -4581,6 +4595,27 @@ fn mod_overlay(dir: &std::path::Path) -> Value {
     meta.get("overlay").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}))
 }
 
+/// A toast drawn by `name`: its mod.json overlay's width, height and frame where the
+/// notification doesn't set them, and its `props` under the notification's fields.
+fn toast_spec(name: &str, defaults: &Value, mut spec: Value) -> Value {
+    spec["mod"] = json!(name);
+    for k in ["width", "height", "frame"] {
+        if spec.get(k).is_none()
+            && let Some(v) = defaults.get(k)
+        {
+            spec[k] = v.clone();
+        }
+    }
+    if let Some(base) = defaults.get("props").and_then(Value::as_object) {
+        let mut merged = base.clone();
+        if let Some(note) = spec.get("notification").and_then(Value::as_object) {
+            merged.extend(note.clone());
+        }
+        spec["notification"] = Value::Object(merged);
+    }
+    spec
+}
+
 fn terminal_menu_spec(name: &str, defaults: &Value, tab: &str, target: Value) -> Value {
     json!({ "mod": name, "kind": "popup",
         "width": defaults.get("width").and_then(Value::as_f64).unwrap_or(220.0),
@@ -5182,6 +5217,31 @@ mod tests {
         root.terminal_menu = Some("personal-menu".into());
         let restored: super::Node = serde_json::from_value(serde_json::to_value(&root).unwrap()).unwrap();
         assert_eq!(restored.terminal_menu.as_deref(), Some("personal-menu"));
+    }
+
+    #[test]
+    fn toast_is_a_root_layout_choice_that_roundtrips() {
+        let mut root = super::default_layout("main");
+        assert_eq!(root.toast, None);
+        assert!(serde_json::to_value(&root).unwrap().get("toast").is_none());
+        root.toast = Some("aqua-toast".into());
+        let restored: super::Node = serde_json::from_value(serde_json::to_value(&root).unwrap()).unwrap();
+        assert_eq!(restored.toast.as_deref(), Some("aqua-toast"));
+    }
+
+    #[test]
+    fn toast_mod_takes_size_frame_and_props_from_mod_json() {
+        let note = json!({ "title": "Claude finished", "level": "info" });
+        let stock = super::toast_spec("toast", &json!({}), json!({ "kind": "toast", "notification": note.clone() }));
+        assert_eq!(stock["mod"], "toast");
+        assert!(stock.get("width").is_none() && stock.get("frame").is_none());
+        assert_eq!(stock["notification"], note);
+        let defaults = json!({ "width": 336, "height": 80, "frame": "none", "props": { "role": "notice", "title": "fallback" } });
+        let custom = super::toast_spec("aqua", &defaults, json!({ "kind": "toast", "height": 90, "notification": note.clone() }));
+        assert_eq!(custom["mod"], "aqua");
+        assert_eq!((custom["width"].as_f64(), custom["height"].as_f64()), (Some(336.0), Some(90.0)), "a notification's own height wins");
+        assert_eq!(custom["frame"], "none");
+        assert_eq!(custom["notification"], json!({ "role": "notice", "title": "Claude finished", "level": "info" }), "the notification's fields win over props");
     }
 
     /// Runs `window::tests::<name>` alone in a test process of its own, on a
