@@ -1,0 +1,60 @@
+# Attractify's own Herdr.app: upstream plus the changes on this branch, built
+# for Apple silicon and attached to a prerelease in this fork. Not for upstream.
+name: attractify-build
+
+on:
+  push:
+    branches: [attractify]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  ZIG_VERSION: 0.16.0
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Restore build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: attractify-macos-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-${{ hashFiles('Cargo.lock') }}
+      - name: Keep unchanged sources fresh
+        run: scripts/ci-sources restore
+      - name: Toast tests
+        run: cargo test --locked toast
+      - name: Build and pack
+        run: scripts/package
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          tag="attractify-$version-${GITHUB_SHA::7}"
+          gh release create "$tag" dist/herdr-app-macos-aarch64.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Herdr $version (Attractify build ${GITHUB_SHA::7})" \
+            --notes "Upstream $version plus the commits on the attractify branch. Ad hoc signed."
