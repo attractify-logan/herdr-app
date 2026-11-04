@@ -5231,17 +5231,17 @@ mod tests {
 
     #[test]
     fn toast_mod_takes_size_frame_and_props_from_mod_json() {
-        let note = json!({ "title": "Claude finished", "level": "info" });
-        let stock = super::toast_spec("toast", &json!({}), json!({ "kind": "toast", "notification": note.clone() }));
+        let note = serde_json::json!({ "title": "Claude finished", "level": "info" });
+        let stock = super::toast_spec("toast", &serde_json::json!({}), serde_json::json!({ "kind": "toast", "notification": note.clone() }));
         assert_eq!(stock["mod"], "toast");
         assert!(stock.get("width").is_none() && stock.get("frame").is_none());
         assert_eq!(stock["notification"], note);
-        let defaults = json!({ "width": 336, "height": 80, "frame": "none", "props": { "role": "notice", "title": "fallback" } });
-        let custom = super::toast_spec("aqua", &defaults, json!({ "kind": "toast", "height": 90, "notification": note.clone() }));
+        let defaults = serde_json::json!({ "width": 336, "height": 80, "frame": "none", "props": { "role": "notice", "title": "fallback" } });
+        let custom = super::toast_spec("aqua", &defaults, serde_json::json!({ "kind": "toast", "height": 90, "notification": note.clone() }));
         assert_eq!(custom["mod"], "aqua");
         assert_eq!((custom["width"].as_f64(), custom["height"].as_f64()), (Some(336.0), Some(90.0)), "a notification's own height wins");
         assert_eq!(custom["frame"], "none");
-        assert_eq!(custom["notification"], json!({ "role": "notice", "title": "Claude finished", "level": "info" }), "the notification's fields win over props");
+        assert_eq!(custom["notification"], serde_json::json!({ "role": "notice", "title": "Claude finished", "level": "info" }), "the notification's fields win over props");
     }
 
     /// Runs `window::tests::<name>` alone in a test process of its own, on a
